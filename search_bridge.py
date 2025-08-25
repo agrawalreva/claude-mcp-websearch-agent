@@ -2,7 +2,7 @@ import os
 import re
 import json
 import requests
-from typing import Dict, List, Any, Optional, Literal
+from typing import Dict, List, Any, Optional, Literal, Protocol
 from dataclasses import dataclass, asdict
 import anthropic
 
@@ -20,7 +20,11 @@ class WebResult:
     url: str
     description: str
 
-class BraveSearchClient:
+class SearchProvider(Protocol):
+    def search(self, query: str, count: int = 10) -> List[WebResult]:
+        ...
+
+class BraveSearchProvider:
     def __init__(self, api_base: str = BRAVE_API_BASE, api_key: str = BRAVE_API_KEY):
         self.api_base = api_base
         self.api_key = api_key
@@ -72,9 +76,13 @@ class BraveSearchClient:
             print(f"Unexpected error during search: {e}")
             return []
 
+def get_search_provider() -> SearchProvider:
+    """Factory function to get the configured search provider."""
+    return BraveSearchProvider()
+
 class ClaudeMCPBridge:
     def __init__(self, llm_provider: LLMProvider = "claude"):
-        self.search_client = BraveSearchClient()
+        self.search_provider = get_search_provider()
         self.llm_provider = llm_provider
 
         if llm_provider == "claude":
@@ -122,7 +130,7 @@ def handle_claude_tool_call(tool_params: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "Missing query parameter"}
     
     bridge = ClaudeMCPBridge()
-    results = bridge.search_client.search(query)
+    results = bridge.search_provider.search(query)
 
     return {
         "results": [asdict(result) for result in results]
