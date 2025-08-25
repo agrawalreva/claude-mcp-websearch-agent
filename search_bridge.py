@@ -4,6 +4,7 @@ import json
 import requests
 import time
 import random
+import math
 from typing import Dict, List, Any, Optional, Literal, Protocol
 from dataclasses import dataclass, asdict
 import anthropic
@@ -15,6 +16,7 @@ HTTP_TIMEOUT_SECONDS = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "12"))
 RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "2"))
 RETRY_JITTER_MS = int(os.environ.get("RETRY_JITTER_MS", "200"))
 ENABLE_ENRICHMENT = os.environ.get("ENABLE_ENRICHMENT", "true").lower() == "true"
+ENABLE_RERANK = os.environ.get("ENABLE_RERANK", "true").lower() == "true"
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 
 LLMProvider = Literal["claude"]
@@ -79,6 +81,54 @@ def enrich_query(query: str) -> List[str]:
     
     return enriched[:3]  # Ensure we don't exceed 3 variants
 
+def rerank_results(query: str, results: List[WebResult]) -> List[WebResult]:
+    """Apply lightweight reranking using TF-IDF style scoring."""
+    if not ENABLE_RERANK or len(results) <= 1:
+        return results
+    
+    query_terms = set(query.lower().split())
+    
+    def calculate_score(result: WebResult) -> float:
+        # Combine title and description for scoring
+        text = f"{result.title} {result.description}".lower()
+        text_terms = text.split()
+        
+        # Simple TF-IDF inspired scoring
+        score = 0.0
+        
+        # Title matches get higher weight
+        title_terms = result.title.lower().split()
+        for term in query_terms:
+            if term in title_terms:
+                score += 2.0  # Title matches are more important
+        
+        # Description matches
+        for term in query_terms:
+            if term in text_terms:
+                score += 1.0
+        
+        # Boost for exact phrase matches
+        if query.lower() in text:
+            score += 3.0
+        
+        # Penalty for very short descriptions
+        if len(result.description) < 50:
+            score -= 0.5
+        
+        return score
+    
+    # Score and sort results
+    scored_results = [(result, calculate_score(result)) for result in results]
+    scored_results.sort(key=lambda x: x[1], reverse=True)
+    
+    # Return results in new order, preserving original as tie-breaker
+    reranked = [result for result, _ in scored_results]
+    
+    log_search_event("info", "Results reranked", query=query, 
+                    results_count=len(reranked), reranking_enabled=ENABLE_RERANK)
+    
+    return reranked
+
 class BraveSearchProvider:
     def __init__(self, api_base: str = BRAVE_API_BASE, api_key: str = BRAVE_API_KEY):
         self.api_base = api_base
@@ -121,10 +171,14 @@ class BraveSearchProvider:
                 if len(unique_results) >= count:
                     break
 
+        # Apply reranking
+        if len(unique_results) > 1:
+            unique_results = rerank_results(query, unique_results)
+
         latency_ms = int((time.time() - start_time) * 1000)
         log_search_event("info", "Search completed", engine="brave", query=query, 
                        results_count=len(unique_results), latency_ms=latency_ms, 
-                       enrichment_enabled=ENABLE_ENRICHMENT)
+                       enrichment_enabled=ENABLE_ENRICHMENT, reranking_enabled=ENABLE_RERANK)
         
         return unique_results[:count]
 
