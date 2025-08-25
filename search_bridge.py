@@ -5,6 +5,8 @@ import requests
 import time
 import random
 import math
+import sqlite3
+import hashlib
 from typing import Dict, List, Any, Optional, Literal, Protocol
 from dataclasses import dataclass, asdict
 import anthropic
@@ -17,6 +19,8 @@ RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "2"))
 RETRY_JITTER_MS = int(os.environ.get("RETRY_JITTER_MS", "200"))
 ENABLE_ENRICHMENT = os.environ.get("ENABLE_ENRICHMENT", "true").lower() == "true"
 ENABLE_RERANK = os.environ.get("ENABLE_RERANK", "true").lower() == "true"
+CACHE_BACKEND = os.environ.get("CACHE_BACKEND", "sqlite")
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "600"))
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 
 LLMProvider = Literal["claude"]
@@ -40,6 +44,95 @@ def log_search_event(level: str, message: str, **kwargs):
         **kwargs
     }
     print(f"[{level.upper()}] {message} | " + " | ".join(f"{k}={v}" for k, v in kwargs.items()))
+
+class SearchCache:
+    def __init__(self, ttl_seconds: int = CACHE_TTL_SECONDS):
+        self.ttl_seconds = ttl_seconds
+        self.db_path = "search_cache.db"
+        self._init_db()
+    
+    def _init_db(self):
+        """Initialize the SQLite database and tables."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS search_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        results TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        query TEXT NOT NULL,
+                        count INTEGER NOT NULL,
+                        enrichment_enabled BOOLEAN NOT NULL,
+                        reranking_enabled BOOLEAN NOT NULL
+                    )
+                """)
+                conn.commit()
+        except Exception as e:
+            log_search_event("error", "Failed to initialize cache", error=str(e))
+    
+    def _generate_cache_key(self, query: str, count: int, enrichment_enabled: bool, reranking_enabled: bool) -> str:
+        """Generate a cache key based on query and configuration."""
+        key_data = f"{query.lower().strip()}:{count}:{enrichment_enabled}:{reranking_enabled}"
+        return hashlib.md5(key_data.encode()).hexdigest()
+    
+    def get(self, query: str, count: int, enrichment_enabled: bool, reranking_enabled: bool) -> Optional[List[WebResult]]:
+        """Retrieve cached results if they exist and are not expired."""
+        if CACHE_BACKEND != "sqlite":
+            return None
+            
+        try:
+            cache_key = self._generate_cache_key(query, count, enrichment_enabled, reranking_enabled)
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    "SELECT results, created_at FROM search_cache WHERE cache_key = ?",
+                    (cache_key,)
+                )
+                row = cursor.fetchone()
+                
+                if row:
+                    results_json, created_at = row
+                    age_seconds = time.time() - created_at
+                    
+                    if age_seconds < self.ttl_seconds:
+                        results = json.loads(results_json)
+                        web_results = [WebResult(**result) for result in results]
+                        log_search_event("info", "Cache hit", query=query, age_seconds=int(age_seconds))
+                        return web_results
+                    else:
+                        # Expired, remove from cache
+                        conn.execute("DELETE FROM search_cache WHERE cache_key = ?", (cache_key,))
+                        conn.commit()
+                        log_search_event("info", "Cache expired", query=query, age_seconds=int(age_seconds))
+            
+            return None
+            
+        except Exception as e:
+            log_search_event("error", "Cache retrieval failed", query=query, error=str(e))
+            return None
+    
+    def set(self, query: str, count: int, enrichment_enabled: bool, reranking_enabled: bool, results: List[WebResult]):
+        """Store results in cache."""
+        if CACHE_BACKEND != "sqlite":
+            return
+            
+        try:
+            cache_key = self._generate_cache_key(query, count, enrichment_enabled, reranking_enabled)
+            results_json = json.dumps([asdict(result) for result in results])
+            created_at = time.time()
+            
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO search_cache 
+                    (cache_key, results, created_at, query, count, enrichment_enabled, reranking_enabled)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (cache_key, results_json, created_at, query, count, enrichment_enabled, reranking_enabled))
+                conn.commit()
+                
+            log_search_event("info", "Results cached", query=query, results_count=len(results))
+            
+        except Exception as e:
+            log_search_event("error", "Cache storage failed", query=query, error=str(e))
 
 def enrich_query(query: str) -> List[str]:
     """Apply simple query enrichment: typo fixes and synonyms."""
@@ -136,6 +229,7 @@ class BraveSearchProvider:
         self.timeout = HTTP_TIMEOUT_SECONDS
         self.max_retries = RETRY_ATTEMPTS
         self.jitter_ms = RETRY_JITTER_MS
+        self.cache = SearchCache()
 
     def search(self, query: str, count: int = 10) -> List[WebResult]:
         if not self.api_key:
@@ -144,6 +238,14 @@ class BraveSearchProvider:
 
         start_time = time.time()
         log_search_event("info", "Starting search", engine="brave", query=query, max_results=count)
+
+        # Check cache first
+        cached_results = self.cache.get(query, count, ENABLE_ENRICHMENT, ENABLE_RERANK)
+        if cached_results:
+            latency_ms = int((time.time() - start_time) * 1000)
+            log_search_event("info", "Search completed from cache", engine="brave", query=query, 
+                           results_count=len(cached_results), latency_ms=latency_ms)
+            return cached_results
 
         # Apply query enrichment
         enriched_queries = enrich_query(query)
@@ -174,6 +276,9 @@ class BraveSearchProvider:
         # Apply reranking
         if len(unique_results) > 1:
             unique_results = rerank_results(query, unique_results)
+
+        # Cache the results
+        self.cache.set(query, count, ENABLE_ENRICHMENT, ENABLE_RERANK, unique_results)
 
         latency_ms = int((time.time() - start_time) * 1000)
         log_search_event("info", "Search completed", engine="brave", query=query, 
