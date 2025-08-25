@@ -1,16 +1,25 @@
-# Claude MCP Web Search Agent
+# Integration of Brave API with Claude via MCP for structured retrieval pipelines
 
-A Model Context Protocol (MCP) integration that provides Claude with real-time web search capabilities using the Brave Search API.
+This project connects Claude to the Brave Search API through the Model Context Protocol (MCP).  
+It gives Claude the ability to pull search results, apply ranking logic, and deliver structured outputs.  
 
-## Features
+---
 
-- **Real-time Web Search**: Integrates with Brave Search API for current information
-- **MCP Integration**: Seamless Claude tool calling via `fetch_web_content`
-- **Query Enhancement**: Automatic typo correction and synonym expansion
-- **Smart Reranking**: TF-IDF style scoring for better result relevance
-- **Caching**: SQLite-based cache with configurable TTL
-- **Retry Logic**: Exponential backoff with jitter for reliability
-- **Structured Logging**: Comprehensive search event logging
+## Introduction
+
+Claude can reason over text with precision, but it cannot fetch or verify information on its own.  
+This project bridges that gap by exposing external search to Claude through the Model Context Protocol (MCP). Brave was chosen as the provider because its API is stable, responses are consistent and the design respects privacy.  
+
+The system integrates Brave Search with Claude using a retrieval pipeline. Queries are normalized, enhanced for typos and synonyms and executed with configurable HTTP timeouts. Requests are retried with exponential backoff and jitter then cached in SQLite to avoid redundant calls.  
+
+Results go through a reranking step that applies TF-IDF style scoring to surface the most relevant entries. The pipeline runs behind a Flask MCP server that exposes the `fetch_web_content` tool, includes health check endpoints, and records logs for traceability. Configuration is handled through environment variables so the setup stays portable.  
+
+Development support includes a pytests that validates caching, retries and tool responses. The cache layer is abstracted so it can be replaced without touching the rest of the system. The final output is clean JSON with titles, URLs, and descriptions that Claude can reason with directly.  
+
+The result is a retrieval service that allows Claude to operate with context beyond its training data, producing answers anchored in real information.
+
+
+---
 
 ## Quick Start
 
@@ -37,41 +46,7 @@ A Model Context Protocol (MCP) integration that provides Claude with real-time w
    python cli.py "What's the latest news about AI?"
    ```
 
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLAUDE_API_KEY` | - | Your Claude API key (required) |
-| `BRAVE_API_KEY` | - | Your Brave Search API key (required) |
-| `BRAVE_API_BASE` | `https://api.search.brave.com/res/v1/web/search` | Brave API endpoint |
-| `HTTP_TIMEOUT_SECONDS` | `12` | HTTP request timeout |
-| `RETRY_ATTEMPTS` | `2` | Number of retry attempts |
-| `RETRY_JITTER_MS` | `200` | Jitter for retry delays |
-| `ENABLE_ENRICHMENT` | `true` | Enable query enhancement |
-| `ENABLE_RERANK` | `true` | Enable result reranking |
-| `CACHE_BACKEND` | `sqlite` | Cache backend (sqlite/none) |
-| `CACHE_TTL_SECONDS` | `600` | Cache TTL in seconds |
-| `MAX_RESULTS` | `8` | Maximum results per search |
-| `PORT` | `5001` | MCP server port |
-| `MCP_SERVER_URL` | `http://localhost:5001` | MCP server URL |
-
-## Architecture
-
-```
-CLI (cli.py) → Claude Client (claude_client.py) → MCP Server (server.py) → Search Bridge (search_bridge.py) → Brave API
-```
-
-- **CLI**: Command-line interface for direct queries
-- **Claude Client**: Handles Claude API communication and tool calls
-- **MCP Server**: Flask-based server exposing the `fetch_web_content` tool
-- **Search Bridge**: Core search logic with enrichment, reranking, and caching
-- **Brave API**: Web search provider
-
-## API Endpoints
-
-- `GET /health` - Health check
-- `GET /` - Server information
-- `POST /tool_call` - Handle Claude tool calls
+---
 
 ## Tool Schema
 
@@ -95,13 +70,25 @@ And returns:
 }
 ```
 
-## Development
+---
 
-Run tests:
-```bash
-pytest
-```
+## Tech Stack
 
-## License
+### Programming Language
+- Python 3.10+
 
-[Add your license here]
+### Frameworks and Libraries
+- Flask (MCP server and API routing)  
+- Requests (HTTP client for Brave API calls)  
+- SQLAlchemy (optional cache abstraction)  
+- Pytest (unit and integration testing)  
+
+### External APIs
+- Brave Search API (search provider)  
+- Claude API (LLM integration through MCP)  
+
+### Databases
+- SQLite (default cache backend)  
+
+### Protocols
+- Model Context Protocol (MCP) for tool integration  
