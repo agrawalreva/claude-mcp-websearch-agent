@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+downloads/
+lib/
+lib64/
+parts/
+sdist/
+var/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Cache
+.cache/
+.pytest_cache/
+
+# Temporary files
+*.tmp
+*.temp 
