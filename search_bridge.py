@@ -10,8 +10,10 @@ import hashlib
 from typing import Dict, List, Any, Optional, Literal, Protocol
 from dataclasses import dataclass, asdict
 import anthropic
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Configuration from environment variables
+# Configuration
 BRAVE_API_BASE = os.environ.get("BRAVE_API_BASE", "https://api.search.brave.com/res/v1/web/search")
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
 HTTP_TIMEOUT_SECONDS = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "12"))
@@ -36,7 +38,7 @@ class SearchProvider(Protocol):
         ...
 
 def log_search_event(level: str, message: str, **kwargs):
-    """Simple structured logging for search events."""
+    """Logging for search events."""
     log_data = {
         "timestamp": time.time(),
         "level": level,
@@ -44,6 +46,25 @@ def log_search_event(level: str, message: str, **kwargs):
         **kwargs
     }
     print(f"[{level.upper()}] {message} | " + " | ".join(f"{k}={v}" for k, v in kwargs.items()))
+
+def create_session_with_pooling():
+    session = requests.Session()
+    
+    # Configure connection pooling
+    adapter = HTTPAdapter(
+        pool_connections=10,  # No. of connection pools to cache
+        pool_maxsize=20,      # Max num of connections in each pool
+        max_retries=Retry(
+            total=RETRY_ATTEMPTS,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+    )
+    
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
 
 class SearchCache:
     def __init__(self, ttl_seconds: int = CACHE_TTL_SECONDS):
@@ -71,9 +92,9 @@ class SearchCache:
             log_search_event("error", "Failed to initialize cache", error=str(e))
     
     def _generate_cache_key(self, query: str, count: int, enrichment_enabled: bool, reranking_enabled: bool) -> str:
-        """Generate a cache key based on query and configuration."""
-        key_data = f"{query.lower().strip()}:{count}:{enrichment_enabled}:{reranking_enabled}"
-        return hashlib.md5(key_data.encode()).hexdigest()
+        """Generate a cache key using hashing."""
+        key_data = f"{query.lower().strip()}:{count}:{int(enrichment_enabled)}:{int(reranking_enabled)}"
+        return hashlib.sha256(key_data.encode('utf-8')).hexdigest()[:16]  #for efficiency?
     
     def get(self, query: str, count: int, enrichment_enabled: bool, reranking_enabled: bool) -> Optional[List[WebResult]]:
         """Retrieve cached results if they exist and are not expired."""
@@ -156,7 +177,7 @@ def enrich_query(query: str) -> List[str]:
             if corrected not in enriched:
                 enriched.append(corrected)
     
-    # Simple synonym expansion (limited to prevent explosion)
+
     synonyms = {
         "fast": ["quick", "rapid"],
         "big": ["large", "huge"],
@@ -172,10 +193,10 @@ def enrich_query(query: str) -> List[str]:
                     if variant not in enriched:
                         enriched.append(variant)
     
-    return enriched[:3]  # Ensure we don't exceed 3 variants
+    return enriched[:3]  
 
 def rerank_results(query: str, results: List[WebResult]) -> List[WebResult]:
-    """Apply lightweight reranking using TF-IDF style scoring."""
+    """Apply reranking using TF-IDF style scoring."""
     if not ENABLE_RERANK or len(results) <= 1:
         return results
     
@@ -186,7 +207,7 @@ def rerank_results(query: str, results: List[WebResult]) -> List[WebResult]:
         text = f"{result.title} {result.description}".lower()
         text_terms = text.split()
         
-        # Simple TF-IDF inspired scoring
+        # Simple TF-IDF scoring
         score = 0.0
         
         # Title matches get higher weight
@@ -230,6 +251,7 @@ class BraveSearchProvider:
         self.max_retries = RETRY_ATTEMPTS
         self.jitter_ms = RETRY_JITTER_MS
         self.cache = SearchCache()
+        self.session = create_session_with_pooling()
 
     def search(self, query: str, count: int = 10) -> List[WebResult]:
         if not self.api_key:
@@ -247,7 +269,6 @@ class BraveSearchProvider:
                            results_count=len(cached_results), latency_ms=latency_ms)
             return cached_results
 
-        # Apply query enrichment
         enriched_queries = enrich_query(query)
         if len(enriched_queries) > 1:
             log_search_event("info", "Query enriched", original=query, variants=len(enriched_queries))
@@ -298,7 +319,7 @@ class BraveSearchProvider:
             "count": min(count, 10)  # Brave API limit
         }
 
-        response = requests.get(
+        response = self.session.get(
             self.api_base,
             headers=headers,
             params=params,
